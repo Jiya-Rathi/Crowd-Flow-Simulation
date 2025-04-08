@@ -25,27 +25,6 @@ class CrowdDataset(Dataset):
         
     def __len__(self):
         return len(self.sequence_files)
-    '''
-    def __getitem__(self, idx):
-        images = []
-        annotations = []
-        
-        for i in range(self.sequence_length):
-            frame_id = self.sequence_files[idx + i]
-            img_path = os.path.join(self.image_dir , frame_id, f"{frame_id}.jpg")
-            ann_path = os.path.join(self.annotation_dir, f"{frame_id}.txt")
-            
-            image = read_image(img_path).float() / 255.0  # Normalize to [0,1]
-            images.append(image)
-            
-            with open(ann_path, 'r') as f:
-                ann = [list(map(int, line.strip().split(','))) for line in f.readlines()]
-                ann = torch.tensor(ann, dtype=torch.float32)
-                annotations.append(ann)
-        
-        images = torch.stack(images)
-        return images[:-1], images[-1], annotations[:-1], annotations[-1]
-    '''
     def __getitem__(self, idx):
         images = []
         annotations = []
@@ -67,7 +46,7 @@ class CrowdDataset(Dataset):
                 annotations.append(ann)
     
         images = torch.stack(images)
-        return images[:-1], images[-1], annotations[:-1], annotations[-1]
+        return images[:20], images[20:], annotations[:20], annotations[20:]
 
     
 # Dataset Paths
@@ -262,51 +241,86 @@ class TCNN(nn.Module):
 
 
 # --- 3. Training Pipeline --- #
-def train(model, train_loader, epochs=50):
+def train(model, train_loader, epochs=200):
     model.to(device)
     model.train()
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    
+
     for epoch in range(epochs):
         epoch_loss = 0
+
         for inputs, targets, _, _ in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs = inputs.to(device)            # [1, 20, 3, H, W]
+            targets = targets.to(device)          # [1, 10, 3, H, W]
+
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+
+            # Autoregressive 10-step prediction
+            preds = []
+            seq = inputs.clone()
+            for _ in range(targets.shape[1]):     # 10 steps
+                out = model(seq)                  # [1, 3, H, W]
+                preds.append(out)
+                seq = torch.cat((seq[:, 1:], out.unsqueeze(1)), dim=1)
+
+            pred_tensor = torch.stack(preds, dim=1)  # [1, 10, 3, H, W]
+            loss = criterion(pred_tensor, targets)
+
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-        print(f"Epoch {epoch+1}, Loss: {epoch_loss / len(train_loader)}")
+
+        print(f"Epoch {epoch+1}, Loss: {epoch_loss / len(train_loader):.4f}")
+
 
 # --- 4. Testing Pipeline --- #
 def evaluate(model, test_loader):
     model.eval()
     total_loss, total_ssim, total_psnr = 0, 0, 0
+    criterion = nn.MSELoss()
+
     with torch.no_grad():
         for inputs, targets, _, _ in test_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-            mse = nn.MSELoss()(outputs, targets).item()
-            
-            targets_np = targets.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            outputs_np = outputs.squeeze(0).permute(1, 2, 0).cpu().numpy()
-    
-            H, W = targets.shape[-2:]  
-            win_size = min(7, H, W) if min(H, W) >= 7 else max(3, min(H, W))  # Ensure valid win_size
-            if win_size % 2 == 0:
-                win_size -= 1  # Ensure win_size is odd
-    
-            ssim_val = ssim(targets_np, outputs_np, 
-                            data_range=outputs_np.max() - outputs_np.min(), 
-                            win_size=win_size, channel_axis=-1)
-    
-            psnr_val = cv2.PSNR(targets_np, outputs_np)
-    
-            total_loss += mse
-            total_ssim += ssim_val
-            total_psnr += psnr_val
-    print(f"Test Loss: {total_loss / len(test_loader)}")
-    print(f"Test SSIM: {total_ssim / len(test_loader)}")
-    print(f"Test PSNR: {total_psnr / len(test_loader)}")
+            inputs = inputs.to(device)   # [1, 20, 3, H, W]
+            targets = targets.to(device) # [1, 10, 3, H, W]
+
+            preds = []
+            seq = inputs.clone()
+            for _ in range(targets.shape[1]):
+                out = model(seq)                  # [1, 3, H, W]
+                preds.append(out)
+                seq = torch.cat((seq[:, 1:], out.unsqueeze(1)), dim=1)
+
+            pred_tensor = torch.stack(preds, dim=1)   # [1, 10, 3, H, W]
+
+            # Compute loss
+            loss = criterion(pred_tensor, targets)
+            total_loss += loss.item()
+
+            # Compute SSIM/PSNR for each frame pair
+            for i in range(targets.shape[1]):
+                t_np = targets[0, i].permute(1, 2, 0).cpu().numpy()
+                p_np = pred_tensor[0, i].permute(1, 2, 0).cpu().numpy()
+
+                # SSIM
+                from skimage.metrics import structural_similarity as ssim
+                import cv2
+
+                win_size = min(7, t_np.shape[0], t_np.shape[1])
+                if win_size % 2 == 0:
+                    win_size -= 1
+                win_size = max(3, win_size)
+
+                ssim_val = ssim(t_np, p_np, data_range=1.0, win_size=win_size, channel_axis=-1)
+                psnr_val = cv2.PSNR(t_np, p_np)
+
+                total_ssim += ssim_val
+                total_psnr += psnr_val
+
+    num_samples = len(test_loader.dataset) * targets.shape[1]
+
+    print(f"Test Loss: {total_loss / len(test_loader):.4f}")
+    print(f"Test SSIM: {total_ssim / num_samples:.4f}")
+    print(f"Test PSNR: {total_psnr / num_samples:.2f} dB")
+
