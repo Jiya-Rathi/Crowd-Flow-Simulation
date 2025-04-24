@@ -8,45 +8,97 @@ import torchvision.transforms as transforms
 from torchvision.io import read_image
 from skimage.metrics import structural_similarity as ssim
 import cv2
+from torchvision.transforms.functional import to_pil_image
+from PIL import Image
+from PIL import ImageDraw
 
 # Check for CUDA
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # --- 1. Dataset Preparation --- #
+
 class CrowdDataset(Dataset):
-    def __init__(self, data_list, image_dir, annotation_dir, sequence_length=30):
+    def __init__(self, data_list, image_dir, annotation_dir, sequence_length=30, save_bbox_dir="./bbox_sequences"):
         self.image_dir = image_dir
         self.annotation_dir = annotation_dir
         self.sequence_length = sequence_length
+        self.save_bbox_dir = save_bbox_dir
         
         with open(data_list, 'r') as f:
             self.sequence_files = [line.strip() for line in f.readlines()]
         
     def __len__(self):
         return len(self.sequence_files)
+
+    def draw_bboxes_on_frame(self, image_tensor, centers, box_size=20):
+        image = to_pil_image(image_tensor)
+        draw = ImageDraw.Draw(image)
+        for x, y in centers:
+            x1, y1 = x - box_size // 2, y - box_size // 2
+            x2, y2 = x + box_size // 2, y + box_size // 2
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
+        return image
+
+    def extract_background(self, image_tensor, centers, box_size=20):
+        img_np = image_tensor.permute(1, 2, 0).numpy()
+        img_uint8 = (img_np * 255).astype(np.uint8)
+        mask = np.zeros((img_np.shape[0], img_np.shape[1]), dtype=np.uint8)
+
+        for x, y in centers:
+            x, y = int(x), int(y)
+            x1, y1 = max(0, x - box_size // 2), max(0, y - box_size // 2)
+            x2, y2 = min(img_np.shape[1], x + box_size // 2), min(img_np.shape[0], y + box_size // 2)
+            mask[y1:y2, x1:x2] = 255
+
+        inpainted = cv2.inpaint(img_uint8, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+        return inpainted
+
     def __getitem__(self, idx):
         images = []
         annotations = []
         
-        sequence_id = self.sequence_files[idx]  # Get the sequence folder name (e.g., "00001")
-        sequence_folder = os.path.join(self.image_dir, sequence_id)  # Path to sequence folder
-        
-        for frame_num in range(1, self.sequence_length + 1):  # Frames from 1 to 30
-            frame_id = f"{frame_num:05d}"  # Ensure zero-padding (e.g., 00001.jpg, 00002.jpg)
+        sequence_id = self.sequence_files[idx]
+        sequence_folder = os.path.join(self.image_dir, sequence_id)
+        ann_path = os.path.join(self.annotation_dir, f"{sequence_id}.txt")
+
+        # Load and parse annotation file once
+        with open(ann_path, 'r') as f:
+            ann_lines = [list(map(int, line.strip().split(','))) for line in f.readlines()]
+        ann_tensor = torch.tensor(ann_lines, dtype=torch.float32)
+
+        bg_path = f"backgrounds/{sequence_id}.jpg"
+        if not os.path.exists(bg_path):
+            frame_id = f"{1:05d}"
             img_path = os.path.join(sequence_folder, f"{frame_id}.jpg")
-            ann_path = os.path.join(self.annotation_dir, f"{sequence_id}.txt")
-    
-            image = read_image(img_path).float() / 255.0  # Normalize image
+            image = read_image(img_path).float() / 255.0
+            frame1_annotations = [(x, y) for f, x, y in ann_lines if f == 1]
+            inpainted_bg = self.extract_background(image, frame1_annotations)
+            os.makedirs("backgrounds", exist_ok=True)
+            cv2.imwrite(bg_path, inpainted_bg[:, :, ::-1])  # RGB to BGR for OpenCV
+
+        for frame_num in range(1, self.sequence_length + 1):
+            frame_id = f"{frame_num:05d}"
+            img_path = os.path.join(sequence_folder, f"{frame_id}.jpg")
+            image = read_image(img_path).float() / 255.0
             images.append(image)
-    
-            with open(ann_path, 'r') as f:
-                ann = [list(map(int, line.strip().split(','))) for line in f.readlines()]
-                ann = torch.tensor(ann, dtype=torch.float32)
-                annotations.append(ann)
-    
+
+            # Get (x, y) for this frame
+            frame_annotations = [(x, y) for f, x, y in ann_lines if f == frame_num]
+            annotations.append(torch.tensor(frame_annotations, dtype=torch.float32))
+
+            # Save image with bbox if not already done
+            save_path = os.path.join(self.save_bbox_dir, sequence_id)
+            os.makedirs(save_path, exist_ok=True)
+            bbox_path = os.path.join(save_path, f"{frame_id}.jpg")
+
+            if not os.path.exists(bbox_path):  # avoid re-saving
+                img_with_bbox = self.draw_bboxes_on_frame(image, frame_annotations)
+                img_with_bbox.save(bbox_path)
+
         images = torch.stack(images)
-        return images[:20], images[20:], annotations[:20], annotations[20:]
+        return images[:25], images[25:], annotations[:25], annotations[25:]
+
 
     
 # Dataset Paths
@@ -240,8 +292,7 @@ class TCNN(nn.Module):
 
 
 
-# --- 3. Training Pipeline --- #
-def train(model, train_loader, epochs=200):
+def train(model, train_loader, epochs=100):
     model.to(device)
     model.train()
     criterion = nn.MSELoss()
