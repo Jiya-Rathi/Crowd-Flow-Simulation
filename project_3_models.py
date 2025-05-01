@@ -11,99 +11,116 @@ import cv2
 from torchvision.transforms.functional import to_pil_image
 from PIL import Image
 from PIL import ImageDraw
-
 # Check for CUDA
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # --- 1. Dataset Preparation --- #
-
+'''
 class CrowdDataset(Dataset):
-    def __init__(self, data_list, image_dir, annotation_dir, sequence_length=30, save_bbox_dir="./bbox_sequences"):
+    def __init__(self, data_list, image_dir, annotation_dir, sequence_length=30, max_objects=150):
         self.image_dir = image_dir
         self.annotation_dir = annotation_dir
         self.sequence_length = sequence_length
-        self.save_bbox_dir = save_bbox_dir
-        
+        self.max_objects = max_objects
+
         with open(data_list, 'r') as f:
             self.sequence_files = [line.strip() for line in f.readlines()]
-        
+
     def __len__(self):
         return len(self.sequence_files)
 
-    def draw_bboxes_on_frame(self, image_tensor, centers, box_size=20):
-        image = to_pil_image(image_tensor)
-        draw = ImageDraw.Draw(image)
-        for x, y in centers:
-            x1, y1 = x - box_size // 2, y - box_size // 2
-            x2, y2 = x + box_size // 2, y + box_size // 2
-            draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
-        return image
-
-    def extract_background(self, image_tensor, centers, box_size=20):
-        img_np = image_tensor.permute(1, 2, 0).numpy()
-        img_uint8 = (img_np * 255).astype(np.uint8)
-        mask = np.zeros((img_np.shape[0], img_np.shape[1]), dtype=np.uint8)
-
-        for x, y in centers:
-            x, y = int(x), int(y)
-            x1, y1 = max(0, x - box_size // 2), max(0, y - box_size // 2)
-            x2, y2 = min(img_np.shape[1], x + box_size // 2), min(img_np.shape[0], y + box_size // 2)
-            mask[y1:y2, x1:x2] = 255
-
-        inpainted = cv2.inpaint(img_uint8, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-        return inpainted
-
     def __getitem__(self, idx):
-        images = []
-        annotations = []
-        
         sequence_id = self.sequence_files[idx]
-        sequence_folder = os.path.join(self.image_dir, sequence_id)
-        ann_path = os.path.join(self.annotation_dir, f"{sequence_id}.txt")
+        ann_path = os.path.join(self.annotation_dir, f"{sequence_id}_with_ids.txt")
 
-        # Load and parse annotation file once
+        # Parse annotations
+        ann_per_frame = {}
         with open(ann_path, 'r') as f:
-            ann_lines = [list(map(int, line.strip().split(','))) for line in f.readlines()]
-        ann_tensor = torch.tensor(ann_lines, dtype=torch.float32)
+            for line in f:
+                parts = list(map(float, line.strip().split(',')))
+                frame_id, track_id, x, y = parts[:4]
+                frame_id = int(frame_id)
+                if frame_id not in ann_per_frame:
+                    ann_per_frame[frame_id] = []
+                ann_per_frame[frame_id].append((int(track_id), x, y))
 
-        bg_path = f"backgrounds/{sequence_id}.jpg"
-        if not os.path.exists(bg_path):
-            frame_id = f"{1:05d}"
-            img_path = os.path.join(sequence_folder, f"{frame_id}.jpg")
-            image = read_image(img_path).float() / 255.0
-            frame1_annotations = [(x, y) for f, x, y in ann_lines if f == 1]
-            inpainted_bg = self.extract_background(image, frame1_annotations)
-            os.makedirs("backgrounds", exist_ok=True)
-            cv2.imwrite(bg_path, inpainted_bg[:, :, ::-1])  # RGB to BGR for OpenCV
+        # Build [T, 150, 3] tensor
+        sequence_tensor = torch.full((self.sequence_length, self.max_objects, 3), -1.0)
 
         for frame_num in range(1, self.sequence_length + 1):
-            frame_id = f"{frame_num:05d}"
-            img_path = os.path.join(sequence_folder, f"{frame_id}.jpg")
-            image = read_image(img_path).float() / 255.0
-            images.append(image)
+            objs = ann_per_frame.get(frame_num, [])
+            for obj in objs:
+                track_id, x, y = obj
+                if track_id < self.max_objects:
+                    sequence_tensor[frame_num - 1, track_id, 0] = track_id
+                    sequence_tensor[frame_num - 1, track_id, 1] = x
+                    sequence_tensor[frame_num - 1, track_id, 2] = y
+        
+        sequence_tensor[..., 1] /= 1920.0  # Normalize x
+        sequence_tensor[..., 2] /= 1080.0  # Normalize y
 
-            # Get (x, y) for this frame
-            frame_annotations = [(x, y) for f, x, y in ann_lines if f == frame_num]
-            annotations.append(torch.tensor(frame_annotations, dtype=torch.float32))
+        # Split into input 25 + target 5
+        input_seq = sequence_tensor[:25]   # [25, 150, 3]
+        target_seq = sequence_tensor[25:30, :, 1:]  # [5, 150, 2] (only x,y)
 
-            # Save image with bbox if not already done
-            save_path = os.path.join(self.save_bbox_dir, sequence_id)
-            os.makedirs(save_path, exist_ok=True)
-            bbox_path = os.path.join(save_path, f"{frame_id}.jpg")
+        return input_seq[:, :, 1:], target_seq
+'''
 
-            if not os.path.exists(bbox_path):  # avoid re-saving
-                img_with_bbox = self.draw_bboxes_on_frame(image, frame_annotations)
-                img_with_bbox.save(bbox_path)
+class CrowdDataset(Dataset):
+    def __init__(self, data_list, image_dir, annotation_dir, sequence_length=30, max_objects=150):
+        self.image_dir = image_dir
+        self.annotation_dir = annotation_dir
+        self.sequence_length = sequence_length
+        self.max_objects = max_objects
 
-        images = torch.stack(images)
-        return images[:25], images[25:], annotations[:25], annotations[25:]
+        with open(data_list, 'r') as f:
+            self.sequence_files = [line.strip() for line in f.readlines()]
+
+    def __len__(self):
+        return len(self.sequence_files)
+
+    def __getitem__(self, idx):
+        sequence_id = self.sequence_files[idx]
+        ann_path = os.path.join(self.annotation_dir, f"{sequence_id}_with_ids.txt")
+
+        # Parse annotations
+        ann_per_frame = {}
+        with open(ann_path, 'r') as f:
+            for line in f:
+                parts = list(map(float, line.strip().split(',')))
+                frame_id, track_id, x, y = parts[:4]
+                frame_id = int(frame_id)
+                if frame_id not in ann_per_frame:
+                    ann_per_frame[frame_id] = []
+                ann_per_frame[frame_id].append((int(track_id), x, y))
+
+        # Build [T, 150, 2] tensor for positions
+        pos_tensor = torch.full((self.sequence_length, self.max_objects, 2), -1.0)
+        for frame_num in range(1, self.sequence_length + 1):
+            objs = ann_per_frame.get(frame_num, [])
+            for track_id, x, y in objs:
+                if track_id < self.max_objects:
+                    pos_tensor[frame_num - 1, track_id, 0] = x / 1920.0  # normalize x
+                    pos_tensor[frame_num - 1, track_id, 1] = y / 1080.0  # normalize y
+
+        # Compute displacements for input (t = 0 to 24 → dxdy of t=1 to 25)
+        input_pos = pos_tensor[:26]  # [26, 150, 2]
+        displacement_input = input_pos[1:] - input_pos[:-1]  # [25, 150, 2]
+
+        # Ground truth future positions (not displacements)
+        future_pos = pos_tensor[26:31]  # [5, 150, 2]
+        combined_input = torch.cat([displacement_input, input_pos[1:]], dim=-1)  # [25, 150, 4]
+        return combined_input, input_pos[25], future_pos  # [25, 150, 4], [150,2], [5,150,2]
+
+        #return displacement_input, input_pos[25], future_pos  # [25,150,2], [150,2], [5,150,2]
+
 
 
     
 # Dataset Paths
 image_dir = "./sequences/" 
-annotation_dir = "./annotations/"
+annotation_dir = "./annotations_with_ids/"
 
 train_dataset = CrowdDataset("trainlist_copy.txt", image_dir, annotation_dir)
 test_dataset = CrowdDataset("testlist_copy.txt", image_dir, annotation_dir)
@@ -113,265 +130,124 @@ test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=
 
 # --- 2. Model Architectures --- #
 
-# Convolutional LSTM (ConvLSTM)
-class ConvLSTM(nn.Module):
-    def __init__(self, input_channels=3, hidden_dim=256):
-        super(ConvLSTM, self).__init__()
-        
-        # ----- ENCODER -----
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, stride=2, padding=1),  # Reduce H, W by 2
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # Reduce further
-            
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # Reduce H, W by 2
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # Reduce further
-            
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # Reduce H, W by 2
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))  # Output shape: (batch, 128, 1, 1)
-        )
+class TrajectoryLSTM(nn.Module):
+    def __init__(self, input_dim=4, hidden_dim=64, output_dim=2, num_layers=2, dropout=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.fc = nn.Linear(hidden_dim, output_dim)
 
-        # ----- LSTM -----
-        self.lstm = nn.LSTM(input_size=128, hidden_size=hidden_dim, num_layers=2, batch_first=True)
+    def forward(self, x):  # x: [B, 150, 25, 4]
+        B, N, T, D = x.shape
+        x = x.view(B * N, T, D)
+        out, _ = self.lstm(x)
+        out = self.norm(out[:, -1, :])
+        pred = self.fc(out)
+        return pred.view(B, N, 2)
 
-        # ----- DECODER -----
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(hidden_dim, 512, kernel_size=3, stride=2, padding=1, output_padding=1),  # Upsample → (2,2)
-            nn.ReLU(),
-            
-            nn.ConvTranspose2d(512, 256, kernel_size=3, stride=2, padding=1, output_padding=1),  # Upsample → (4,4)
-            nn.ReLU(),
-            
-            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),  # Upsample → (8,8)
-            nn.ReLU(),
-            
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),  # Upsample → (16,16)
-            nn.ReLU(),
-            
-            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),  # Upsample → (32,32)
-            nn.ReLU(),
-            
-            nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1),  # Upsample → (64,64)
-            nn.ReLU(),
-            
-            nn.ConvTranspose2d(16, 8, kernel_size=3, stride=2, padding=1, output_padding=1),  # Upsample → (128,128)
-            nn.ReLU(),
-            
-            nn.ConvTranspose2d(8, 4, kernel_size=3, stride=2, padding=1, output_padding=1),  # Upsample → (256,256)
-            nn.ReLU(),
-            
-            nn.ConvTranspose2d(4, 3, kernel_size=3, stride=2, padding=1, output_padding=1),  # Upsample → (512,512)
-            nn.ReLU(),
-            
-            nn.ConvTranspose2d(3, 3, kernel_size=3, stride=2, padding=1, output_padding=1),  # Upsample → (1024,1024)
-            nn.ReLU(),
-            
-            nn.ConvTranspose2d(3, 3, kernel_size=3, stride=1, padding=1),  # Final adjustment → (1080, 1920)
-            nn.Upsample(size=(1080, 1920), mode='bilinear', align_corners=True),
-            nn.Sigmoid()  # Normalize output to [0,1]
-        )
+def masked_mse(pred, target, mask):
+    loss = (pred - target) ** 2
+    loss = loss * mask.unsqueeze(-1)  # [B, 150, 5, 2]
+    return loss.sum() / mask.sum().clamp(min=1)
 
-    def forward(self, x):
-        batch_size, seq_len, c, h, w = x.shape
-        #print(f"Input shape: {x.shape}")  # Debugging
+def masked_l2(pred, target, mask, clip_thresh = 1000):
+    dist = torch.sqrt(((pred - target) ** 2).sum(dim=-1))  # [B, 150, 5]
+    dist = dist * mask
+    if clip_thresh is not None:
+        dist = torch.clamp(dist, max=clip_thresh)
+    return dist.sum() / mask.sum().clamp(min=1)
 
-        x = x.view(batch_size * seq_len, c, h, w)  
-        x = self.encoder(x)  
-        #print(f"Shape after CNN Encoder: {x.shape}")  # Expected: (batch*seq, 128, 1, 1)
-
-        x = x.view(batch_size, seq_len, -1)  # Flatten for LSTM
-        #print(f"Shape before LSTM: {x.shape}")  # Expected: (batch, seq, 128)
-        
-        x, _ = self.lstm(x)  
-        #print(f"Shape after LSTM: {x.shape}")  # Expected: (batch, seq, hidden_dim)
-        
-        x = x[:, -1, :].view(batch_size, -1, 1, 1)  # Take last sequence output
-        x = self.decoder(x)
-
-        return x
-
-# Social LSTM (S-LSTM)
-class SocialLSTM(nn.Module):
-    def __init__(self, input_channels=3, feature_dim=128, hidden_dim=256):
-        super(SocialLSTM, self).__init__()
-
-        # CNN Encoder: turns each frame into a feature vector
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(64, feature_dim, kernel_size=3, stride=2, padding=1),
-            nn.AdaptiveAvgPool2d((1, 1))  # Output: [B, feature_dim, 1, 1]
-        )
-
-        # LSTM operates on encoded features
-        self.lstm = nn.LSTM(input_size=feature_dim, hidden_size=hidden_dim, num_layers=2, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, feature_dim)
-
-        # Final decoder to image size
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(feature_dim, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),
-            nn.Upsample(size=(1080, 1920), mode='bilinear', align_corners=True),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        batch_size, seq_len, c, h, w = x.shape
-
-        # Reshape: [B*T, C, H, W] → CNN Encoder
-        x = x.view(batch_size * seq_len, c, h, w)
-        x = self.encoder(x)                          # [B*T, F, 1, 1]
-        x = x.view(batch_size, seq_len, -1)          # [B, T, F]
-
-        x, _ = self.lstm(x)                           # [B, T, hidden_dim]
-        x = self.fc(x[:, -1, :])                      # [B, feature_dim]
-        x = x.view(batch_size, -1, 1, 1)              # [B, feature_dim, 1, 1]
-        x = self.decoder(x)                           # [B, 3, 1080, 1920]
-        return x
-
-
-# Temporal Convolutional Neural Network (TCNN)
-class TCNN(nn.Module):
-    def __init__(self, input_channels=3, feature_dim=128, hidden_dim=256):
-        super(TCNN, self).__init__()
-        
-        # --- CNN Encoder ---
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, stride=2, padding=1),  # [B, 32, H/2, W/2]
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # [B, 32, H/4, W/4]
-            
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # [B, 64, H/8, W/8]
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # [B, 64, H/16, W/16]
-            
-            nn.Conv2d(64, feature_dim, kernel_size=3, stride=2, padding=1),  # [B, feature_dim, H/32, W/32]
-            nn.AdaptiveAvgPool2d((1, 1))  # [B, feature_dim, 1, 1]
-        )
-
-        # --- Temporal Conv (1D) ---
-        self.tcn = nn.Conv1d(feature_dim, hidden_dim, kernel_size=3, padding=1)
-        self.fc = nn.Linear(hidden_dim, feature_dim)
-
-        # --- Simple Decoder back to image (optional or minimal) ---
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(feature_dim, 64, kernel_size=4, stride=2, padding=1),  # [B, 64, 2, 2]
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # [B, 32, 4, 4]
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),   # [B, 3, 8, 8] (or upsample more)
-            nn.Upsample(size=(1080, 1920), mode='bilinear', align_corners=True),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # x: [batch_size, seq_len, C, H, W]
-        batch_size, seq_len, c, h, w = x.shape
-
-        x = x.view(batch_size * seq_len, c, h, w)     # [B*T, C, H, W]
-        x = self.encoder(x)                           # [B*T, F, 1, 1]
-        x = x.view(batch_size, seq_len, -1)           # [B, T, F]
-        x = x.permute(0, 2, 1)                         # [B, F, T]
-        x = self.tcn(x)                                # [B, hidden_dim, T]
-        x = self.fc(x[:, :, -1])                       # [B, feature_dim]
-
-        x = x.view(batch_size, -1, 1, 1)               # [B, F, 1, 1]
-        x = self.decoder(x)                            # [B, 3, 1080, 1920]
-        return x
-
-
-
-def train(model, train_loader, epochs=100):
+def train(model, dataloader, epochs=50, clip_thresh=1000):
     model.to(device)
-    model.train()
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
     for epoch in range(epochs):
-        epoch_loss = 0
+        model.train()
+        total_mse, total_l2_clipped = 0, 0
 
-        for inputs, targets, _, _ in train_loader:
-            inputs = inputs.to(device)            # [1, 20, 3, H, W]
-            targets = targets.to(device)          # [1, 10, 3, H, W]
+        for full_seq, last_pos, future in dataloader:
+            # full_seq: [B, 25, 150, 4] → [B, 150, 25, 4]
+            seq = full_seq.permute(0, 2, 1, 3).to(device)  
+            last_pos = last_pos.to(device)                # [B, 150, 2]
+            future = future.permute(0, 2, 1, 3).to(device) # [B, 150, 5, 2]
+
+            preds = []
+            curr_pos = last_pos.clone()
+
+            for _ in range(5):
+                delta = model(seq)            # [B, 150, 2]
+                curr_pos = curr_pos + delta   # [B, 150, 2]
+                preds.append(curr_pos)
+
+                dxdy = delta.unsqueeze(2)     # [B, 150, 1, 2]
+                absxy = curr_pos.unsqueeze(2) # [B, 150, 1, 2]
+                new_input = torch.cat([dxdy, absxy], dim=-1)  # [B, 150, 1, 4]
+
+                seq = torch.cat((seq[:, :, 1:], new_input), dim=2)
+
+            pred_tensor = torch.stack(preds, dim=1).permute(1, 2, 0, 3)  # [B, 150, 5, 2]
+
+            # Unnormalize
+            pred_tensor[..., 0] *= 1920.0
+            pred_tensor[..., 1] *= 1080.0
+            future[..., 0] *= 1920.0
+            future[..., 1] *= 1080.0
+
+            mask = (future[..., 0] != -1920).float()
+
+            loss_mse = masked_mse(pred_tensor, future, mask)
+            loss_l2 = masked_l2(pred_tensor, future, mask, clip_thresh)
 
             optimizer.zero_grad()
-
-            # Autoregressive 10-step prediction
-            preds = []
-            seq = inputs.clone()
-            for _ in range(targets.shape[1]):     # 10 steps
-                out = model(seq)                  # [1, 3, H, W]
-                preds.append(out)
-                seq = torch.cat((seq[:, 1:], out.unsqueeze(1)), dim=1)
-
-            pred_tensor = torch.stack(preds, dim=1)  # [1, 10, 3, H, W]
-            loss = criterion(pred_tensor, targets)
-
-            loss.backward()
+            loss_mse.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            epoch_loss += loss.item()
 
-        print(f"Epoch {epoch+1}, Loss: {epoch_loss / len(train_loader):.4f}")
+            total_mse += loss_mse.item()
+            total_l2_clipped += loss_l2.item()
+
+        print(f"Epoch {epoch+1}, MSE: {total_mse / len(dataloader):.2f}, "
+              f"L2 (clipped): {total_l2_clipped / len(dataloader):.2f} px")
 
 
-# --- 4. Testing Pipeline --- #
-def evaluate(model, test_loader):
+
+def evaluate(model, dataloader, clip_thresh=1000):
     model.eval()
-    total_loss, total_ssim, total_psnr = 0, 0, 0
-    criterion = nn.MSELoss()
+    total_mse, total_l2_clipped = 0, 0
 
     with torch.no_grad():
-        for inputs, targets, _, _ in test_loader:
-            inputs = inputs.to(device)   # [1, 20, 3, H, W]
-            targets = targets.to(device) # [1, 10, 3, H, W]
+        for full_seq, last_pos, future in dataloader:
+            seq = full_seq.permute(0, 2, 1, 3).to(device)
+            last_pos = last_pos.to(device)
+            future = future.permute(0, 2, 1, 3).to(device)
 
             preds = []
-            seq = inputs.clone()
-            for _ in range(targets.shape[1]):
-                out = model(seq)                  # [1, 3, H, W]
-                preds.append(out)
-                seq = torch.cat((seq[:, 1:], out.unsqueeze(1)), dim=1)
+            curr_pos = last_pos.clone()
 
-            pred_tensor = torch.stack(preds, dim=1)   # [1, 10, 3, H, W]
+            for _ in range(5):
+                delta = model(seq)
+                curr_pos = curr_pos + delta
+                preds.append(curr_pos)
 
-            # Compute loss
-            loss = criterion(pred_tensor, targets)
-            total_loss += loss.item()
+                dxdy = delta.unsqueeze(2)
+                absxy = curr_pos.unsqueeze(2)
+                new_input = torch.cat([dxdy, absxy], dim=-1)
+                seq = torch.cat((seq[:, :, 1:], new_input), dim=2)
 
-            # Compute SSIM/PSNR for each frame pair
-            for i in range(targets.shape[1]):
-                t_np = targets[0, i].permute(1, 2, 0).cpu().numpy()
-                p_np = pred_tensor[0, i].permute(1, 2, 0).cpu().numpy()
+            pred_tensor = torch.stack(preds, dim=1).permute(1, 2, 0, 3)
 
-                # SSIM
-                from skimage.metrics import structural_similarity as ssim
-                import cv2
+            pred_tensor[..., 0] *= 1920.0
+            pred_tensor[..., 1] *= 1080.0
+            future[..., 0] *= 1920.0
+            future[..., 1] *= 1080.0
 
-                win_size = min(7, t_np.shape[0], t_np.shape[1])
-                if win_size % 2 == 0:
-                    win_size -= 1
-                win_size = max(3, win_size)
+            mask = (future[..., 0] != -1920).float()
+            loss_mse = masked_mse(pred_tensor, future, mask)
+            loss_l2 = masked_l2(pred_tensor, future, mask, clip_thresh)
 
-                ssim_val = ssim(t_np, p_np, data_range=1.0, win_size=win_size, channel_axis=-1)
-                psnr_val = cv2.PSNR(t_np, p_np)
+            total_mse += loss_mse.item()
+            total_l2_clipped += loss_l2.item()
 
-                total_ssim += ssim_val
-                total_psnr += psnr_val
-
-    num_samples = len(test_loader.dataset) * targets.shape[1]
-
-    print(f"Test Loss: {total_loss / len(test_loader):.4f}")
-    print(f"Test SSIM: {total_ssim / num_samples:.4f}")
-    print(f"Test PSNR: {total_psnr / num_samples:.2f} dB")
+    print(f"Eval MSE: {total_mse / len(dataloader):.2f}")
+    print(f"Eval L2 (clipped): {total_l2_clipped / len(dataloader):.2f} pixels")
 
